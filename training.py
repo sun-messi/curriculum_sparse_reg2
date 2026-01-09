@@ -571,7 +571,8 @@ def train_model(model, dataloader: DataLoader, config, exp_name: str, M1=None, M
     }
 
     track_similarities = M1 is not None and M2 is not None
-    similarity_freq = getattr(config, 'similarity_freq', 2)
+    similarity_iter_freq = 30  # 每30个iteration保存一次，与curriculum_reg一致
+    next_save_iter = similarity_iter_freq
 
     iteration_count = 0
 
@@ -598,6 +599,45 @@ def train_model(model, dataloader: DataLoader, config, exp_name: str, M1=None, M
             total_loss += loss.item()
             iteration_count += 1
 
+            # Track similarities every similarity_iter_freq iterations
+            if track_similarities and iteration_count >= next_save_iter and is_main_process(rank):
+                model.eval()
+                with torch.no_grad():
+                    similarities = analyze_similarities(net, M1, M2)
+
+                    # Get W, V weights
+                    if hasattr(net, 'W'):
+                        W, V = net.W.weight, net.V.weight
+                        b_hidden = net.W.bias
+                        b_output = net.V.bias
+                    else:
+                        W = net.net[0].weight
+                        V = net.net[2].weight
+                        b_hidden = net.net[0].bias
+                        b_output = net.net[2].bias
+
+                    model_state = {
+                        'weights': {name: param.clone().detach().cpu()
+                                    for name, param in net.state_dict().items()},
+                        'neurons': {
+                            'W': W.clone().detach().cpu(),
+                            'V': V.clone().detach().cpu(),
+                            'b_hidden': b_hidden.clone().detach().cpu(),
+                            'b_output': b_output.clone().detach().cpu()
+                        }
+                    }
+
+                    training_history['similarities'].append({
+                        'iteration': iteration_count,
+                        'epoch': epoch,
+                        'batch': batch_idx,
+                        'loss': loss.item(),
+                        'similarities': similarities,
+                        'model_state': model_state
+                    })
+                model.train()
+                next_save_iter += similarity_iter_freq
+
         avg_loss = total_loss / num_batches
         training_history['losses'].append({
             'iteration': iteration_count,
@@ -605,7 +645,7 @@ def train_model(model, dataloader: DataLoader, config, exp_name: str, M1=None, M
             'avg_loss': avg_loss
         })
         if is_main_process(rank):
-            print(f"[{exp_name}] Epoch {epoch:02d}/{config.epochs} | Loss: {avg_loss:.6f}")
+            print(f"[{exp_name}] Epoch {epoch:02d}/{config.epochs} | Loss: {avg_loss:.6f} | Iter: {iteration_count}")
 
     return training_history
 

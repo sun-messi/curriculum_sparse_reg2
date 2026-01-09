@@ -41,10 +41,8 @@ class Config:
     curriculum_epochs_per_stage = 8
     max_accumulated_stages = 6
 
-    epochs = curriculum_epochs_per_stage * max_accumulated_stages
-    epochs = 30
-
     num_curriculum_stages = 10
+    epochs = curriculum_epochs_per_stage * num_curriculum_stages  # 80 epochs for baseline
     time_ranges = [
         (0.3, 1, "0.3-1"),
     ]
