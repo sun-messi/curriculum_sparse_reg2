@@ -42,7 +42,7 @@ class Config:
     max_accumulated_stages = 6
 
     num_curriculum_stages = 10
-    epochs = curriculum_epochs_per_stage * num_curriculum_stages  # 80 epochs for baseline
+    epochs = 60  # Total epochs
     time_ranges = [
         (0.3, 1, "0.3-1"),
     ]
@@ -51,7 +51,7 @@ class Config:
 
     # ========== Group L1 Regularization 参数 ==========
     reg_enabled = True
-    lambda_max = 0.001             # 正则化系数最大值 (λ_w = λ_v 使用相同值) 1e-3
+    lambda_max = 1e-3           # 正则化系数最大值 (λ_w = λ_v 使用相同值)
     lambda_schedule_type = "linear"  # "linear", "cosine", "exponential"
     reg_threshold = 1e-1           # 判断神经元活跃的阈值
 

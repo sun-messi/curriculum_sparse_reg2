@@ -75,8 +75,21 @@ def run_experiment(t_start: float, t_end: float, exp_name: str,
             model, config, exp_name, M1, M2, t_start, t_end,
             rank=rank, world_size=world_size
         )
+    elif reg_enabled:
+        # Reg only (no curriculum) - lambda decays from lambda_max to 0 over first 30 epochs
+        if is_main_process(rank):
+            print(f"\n[{exp_name}] Using Group L1 Regularization only (no curriculum)")
+            print(f"[{exp_name}] Lambda schedule: {config.lambda_max} -> 0 over 30 epochs")
+        dataset = DiffusionDataset(config, M1, M2, t_start, t_end)
+        dataloader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True)
+        training_history = train_model(
+            model, dataloader, config, exp_name, M1, M2,
+            rank=rank, world_size=world_size,
+            reg_lambda=config.lambda_max,
+            use_lambda_schedule=True
+        )
     else:
-        # Standard training
+        # Standard training (baseline)
         if is_main_process(rank):
             print(f"\n[{exp_name}] Using Standard Training")
         dataset = DiffusionDataset(config, M1, M2, t_start, t_end)

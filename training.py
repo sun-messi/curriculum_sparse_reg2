@@ -552,8 +552,14 @@ def train_curriculum_model(model, config, exp_name: str, M1, M2, t_start_full, t
 
 
 def train_model(model, dataloader: DataLoader, config, exp_name: str, M1=None, M2=None,
-                rank: int = 0, world_size: int = 1, sampler=None):
-    """Train the denoiser model (non-curriculum version)"""
+                rank: int = 0, world_size: int = 1, sampler=None,
+                reg_lambda: float = 0.0, use_lambda_schedule: bool = False):
+    """Train the denoiser model (non-curriculum version)
+
+    Args:
+        reg_lambda: 正则化系数最大值，0.0 表示不使用正则化
+        use_lambda_schedule: 是否使用递减 lambda schedule (从 reg_lambda 递减到 0)
+    """
     from analysis import analyze_similarities
 
     device = get_device(rank) if world_size > 1 else config.device
@@ -561,12 +567,19 @@ def train_model(model, dataloader: DataLoader, config, exp_name: str, M1=None, M
     model.train()
 
     net = model.module if hasattr(model, 'module') else model
+    use_reg = reg_lambda > 0 and isinstance(net, RegDenoiser)
 
     if is_main_process(rank):
         print(f"[{exp_name}] Training started...")
+        if use_reg:
+            if use_lambda_schedule:
+                print(f"[{exp_name}] Using Group L1 regularization with lambda schedule: {reg_lambda} -> 0")
+            else:
+                print(f"[{exp_name}] Using Group L1 regularization with lambda={reg_lambda}")
 
     training_history = {
         'losses': [],
+        'reg_losses': [],
         'similarities': []
     }
 
@@ -575,12 +588,24 @@ def train_model(model, dataloader: DataLoader, config, exp_name: str, M1=None, M
     next_save_iter = similarity_iter_freq
 
     iteration_count = 0
+    total_reg = 0.0
 
     for epoch in range(1, config.epochs + 1):
         if sampler is not None:
             sampler.set_epoch(epoch)
 
+        # Compute current lambda for this epoch (linear decay from reg_lambda to 0 over first 30 epochs)
+        if use_lambda_schedule:
+            decay_epochs = 30  # Lambda decays to 0 over first 30 epochs
+            if epoch <= decay_epochs:
+                current_lambda = reg_lambda * (1 - (epoch - 1) / (decay_epochs - 1))
+            else:
+                current_lambda = 0.0
+        else:
+            current_lambda = reg_lambda
+
         total_loss = 0.0
+        total_reg = 0.0
         num_batches = len(dataloader)
 
         for batch_idx, (x_t, x_clean, t, eps) in enumerate(dataloader):
@@ -590,13 +615,22 @@ def train_model(model, dataloader: DataLoader, config, exp_name: str, M1=None, M
 
             pred = model(x_t)
             target = x_clean if config.predict_mode == "x" else eps
-            loss = F.mse_loss(pred, target)
+            mse_loss = F.mse_loss(pred, target)
+
+            # Add regularization if enabled
+            if use_reg:
+                reg_loss = net.get_group_l1_penalty(current_lambda, current_lambda)
+                loss = mse_loss + reg_loss
+            else:
+                reg_loss = torch.tensor(0.0, device=device)
+                loss = mse_loss
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
             total_loss += loss.item()
+            total_reg += reg_loss.item()
             iteration_count += 1
 
             # Track similarities every similarity_iter_freq iterations
@@ -639,13 +673,18 @@ def train_model(model, dataloader: DataLoader, config, exp_name: str, M1=None, M
                 next_save_iter += similarity_iter_freq
 
         avg_loss = total_loss / num_batches
+        avg_reg = total_reg / num_batches
         training_history['losses'].append({
             'iteration': iteration_count,
             'epoch': epoch,
-            'avg_loss': avg_loss
+            'avg_loss': avg_loss,
+            'avg_reg': avg_reg
         })
         if is_main_process(rank):
-            print(f"[{exp_name}] Epoch {epoch:02d}/{config.epochs} | Loss: {avg_loss:.6f} | Iter: {iteration_count}")
+            if use_reg:
+                print(f"[{exp_name}] Epoch {epoch:02d}/{config.epochs} | Loss: {avg_loss:.6f} | Reg: {avg_reg:.6f} | Iter: {iteration_count}")
+            else:
+                print(f"[{exp_name}] Epoch {epoch:02d}/{config.epochs} | Loss: {avg_loss:.6f} | Iter: {iteration_count}")
 
     return training_history
 
