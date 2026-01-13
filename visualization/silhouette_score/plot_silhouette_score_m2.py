@@ -250,8 +250,8 @@ def main():
     output_dir = Path(__file__).parent / 'outputs'
     output_dir.mkdir(exist_ok=True)
 
-    n_samples_per_class = 100
-    t = 0.5  # noise level
+    n_samples_per_class = 500
+    t = 0.3  # noise level
 
     # Load experiments
     experiments = {

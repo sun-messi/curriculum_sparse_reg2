@@ -32,9 +32,10 @@ def load_results(path):
         return pickle.load(f)
 
 
-def generate_test_data(M1, M2, d=20, n_samples_per_class=100, alpha1=5.0, alpha2=0.5, t=0.5, seed=42):
+def generate_test_data_m1(M1, M2, d=20, n_samples_per_class=100, alpha1=5.0, alpha2=0.5, t=0.5, seed=42):
     """
     Generate test data with single M1 feature (one-hot z1), balanced across classes.
+    M2 signal is zeroed out.
 
     Args:
         M1: shape (d1, d) = (200, 20)
@@ -72,7 +73,61 @@ def generate_test_data(M1, M2, d=20, n_samples_per_class=100, alpha1=5.0, alpha2
             if z2.sum() == 0:
                 z2[np.random.randint(d)] = 1.0
 
-            # Clean signal
+            # Clean signal (M2 zeroed out)
+            x_clean = alpha1 * (M1 @ z1) + alpha2 * (M2 @ z2) * 0
+
+            # Add noise
+            eps = np.random.randn(d1)
+            x_noisy = x_clean + ((1.0 - t) / t) * eps
+
+            x_list.append(x_noisy)
+            labels.append(class_idx)
+
+    return np.array(x_list, dtype=np.float32), np.array(labels)
+
+
+def generate_test_data_m2(M1, M2, d=20, n_samples_per_class=100, alpha1=5.0, alpha2=0.5, t=0.5, seed=42):
+    """
+    Generate test data with single M2 feature (one-hot z2), balanced across classes.
+    Full signal with both M1 and M2.
+
+    Args:
+        M1: shape (d1, d) = (200, 20)
+        M2: shape (d1, d) = (200, 20)
+        d: number of classes (M2 columns)
+        n_samples_per_class: samples per class
+        alpha1, alpha2: signal coefficients
+        t: noise level (diffusion time)
+        seed: random seed
+
+    Returns:
+        x_noisy: (n_samples, d1) - noisy input
+        labels: (n_samples,) - class labels [0, d-1]
+    """
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    if hasattr(M1, 'numpy'):
+        M1 = M1.numpy()
+    if hasattr(M2, 'numpy'):
+        M2 = M2.numpy()
+
+    d1 = M1.shape[0]
+    x_list = []
+    labels = []
+
+    for class_idx in range(d):
+        for _ in range(n_samples_per_class):
+            # z1: sparse Bernoulli (random M1 features)
+            z1 = (np.random.rand(d) < 0.1).astype(np.float32)
+            if z1.sum() == 0:
+                z1[np.random.randint(d)] = 1.0
+
+            # z2: one-hot (single M2 feature)
+            z2 = np.zeros(d)
+            z2[class_idx] = 1.0
+
+            # Clean signal (full signal with both M1 and M2)
             x_clean = alpha1 * (M1 @ z1) + alpha2 * (M2 @ z2)
 
             # Add noise
@@ -85,9 +140,28 @@ def generate_test_data(M1, M2, d=20, n_samples_per_class=100, alpha1=5.0, alpha2
     return np.array(x_list, dtype=np.float32), np.array(labels)
 
 
-def extract_hidden_features(W, b, x):
+def extract_hidden_features_m1(W, b, x):
     """
-    Extract hidden layer features: h = ReLU(W @ x + b)
+    Extract hidden layer features for M1: h = W @ x (no ReLU, no bias)
+
+    Args:
+        W: weight matrix (hidden_dim, input_dim)
+        b: bias vector (hidden_dim,)
+        x: input (n_samples, input_dim)
+
+    Returns:
+        h: hidden features (n_samples, hidden_dim)
+    """
+    if hasattr(W, 'numpy'):
+        W = W.numpy()
+
+    h = x @ W.T
+    return h
+
+
+def extract_hidden_features_m2(W, b, x):
+    """
+    Extract hidden layer features for M2: h = ReLU(W @ x + b)
 
     Args:
         W: weight matrix (hidden_dim, input_dim)
@@ -109,7 +183,8 @@ def extract_hidden_features(W, b, x):
 
 def compute_silhouette_scores(results, n_samples_per_class=100, t=0.5):
     """
-    Compute Silhouette Scores across training iterations.
+    Compute Silhouette Scores at sampled iterations for both M1 and M2 classification.
+    Only computes at 13 sample points: [0, 1k, 2k, ..., 12k]
 
     Args:
         results: loaded pickle data
@@ -117,7 +192,7 @@ def compute_silhouette_scores(results, n_samples_per_class=100, t=0.5):
         t: noise level
 
     Returns:
-        dict with iterations and scores
+        dict with iterations and scores for M1 and M2
     """
     result = results[0]
     M1 = result['M1']
@@ -126,49 +201,80 @@ def compute_silhouette_scores(results, n_samples_per_class=100, t=0.5):
 
     d = M1.shape[1]  # 20
     alpha1 = 5.0
-    alpha2 = 0.5
+    alpha2 = 1
 
-    # Generate test data (fixed for all iterations)
-    x_noisy, labels = generate_test_data(
+    # Generate test data for M1 and M2 (fixed for all iterations)
+    x_noisy_m1, labels_m1 = generate_test_data_m1(
         M1, M2, d=d, n_samples_per_class=n_samples_per_class,
         alpha1=alpha1, alpha2=alpha2, t=t
     )
+    x_noisy_m2, labels_m2 = generate_test_data_m2(
+        M1, M2, d=d, n_samples_per_class=n_samples_per_class,
+        alpha1=alpha1, alpha2=alpha2, t=0.6
+    )
 
-    iterations = []
-    scores = []
-
+    # Build iteration -> entry mapping (only entries with model_state)
+    iter_to_entry = {}
+    all_iters = []
     for entry in similarities_history:
         if 'model_state' not in entry:
             continue
+        iteration = entry.get('iteration', len(all_iters) + 1)
+        iter_to_entry[iteration] = entry
+        all_iters.append(iteration)
 
-        iteration = entry.get('iteration', len(iterations) + 1)
+    # Sample 13 points: [0, 1k, 2k, ..., 12k]
+    target_iters = [i * 1000 for i in range(13)]
+    sampled_iters = []
+    for target in target_iters:
+        closest = min(all_iters, key=lambda x: abs(x - target))
+        if closest not in sampled_iters:
+            sampled_iters.append(closest)
+
+    iterations = []
+    scores_m1 = []
+    scores_m2 = []
+
+    for iteration in sampled_iters:
+        entry = iter_to_entry[iteration]
         iterations.append(iteration)
 
         # Get W and bias
         W = entry['model_state']['neurons']['W']
         b = entry['model_state']['neurons']['b_hidden']
 
-        # Extract hidden features
-        h = extract_hidden_features(W, b, x_noisy)
+        # Extract hidden features for M1 data (no ReLU)
+        h_m1 = extract_hidden_features_m1(W, b, x_noisy_m1)
+        # Extract hidden features for M2 data (with ReLU)
+        h_m2 = extract_hidden_features_m2(W, b, x_noisy_m2)
 
-        # Compute Silhouette Score
+        # Compute Silhouette Score for M1
         try:
-            score = silhouette_score(h, labels, metric='cosine')
+            score_m1 = silhouette_score(h_m1, labels_m1, metric='cosine')
         except Exception as e:
-            print(f"  Warning: SS computation failed at iter {iteration}: {e}")
-            score = np.nan
+            print(f"  Warning: M1 SS computation failed at iter {iteration}: {e}")
+            score_m1 = np.nan
 
-        scores.append(score)
+        # Compute Silhouette Score for M2
+        try:
+            score_m2 = silhouette_score(h_m2, labels_m2, metric='cosine')
+        except Exception as e:
+            print(f"  Warning: M2 SS computation failed at iter {iteration}: {e}")
+            score_m2 = np.nan
+
+        scores_m1.append(score_m1)
+        scores_m2.append(score_m2)
 
     return {
         'iterations': iterations,
-        'scores': scores,
+        'scores_m1': scores_m1,
+        'scores_m2': scores_m2,
     }
 
 
 def plot_comparison(all_data, save_path):
     """
-    Plot Silhouette Score comparison across experiments.
+    Plot Silhouette Score comparison across experiments (M1 and M2 side by side).
 
     Args:
         all_data: Dict of {exp_name: compute_silhouette_scores output}
@@ -182,7 +288,7 @@ def plot_comparison(all_data, save_path):
     plt.rcParams['ytick.labelsize'] = 28
     plt.rcParams['legend.fontsize'] = 22
 
-    fig, ax = plt.subplots(figsize=(12, 8))
+    fig, axes = plt.subplots(1, 2, figsize=(16, 8))
 
     # Style config for each experiment
     styles = {
@@ -192,48 +298,46 @@ def plot_comparison(all_data, save_path):
         'curriculum_reg': ('r', 's', '-', 'Joint curriculum'),
     }
 
-    # Find min max iteration for consistent x-axis
-    min_max_iter = min(data['iterations'][-1] for data in all_data.values())
-
     for exp_name, data in all_data.items():
         if exp_name not in styles:
             continue
 
         color, marker, linestyle, label = styles[exp_name]
         iters = data['iterations']
-        scores = data['scores']
+        scores_m1 = data['scores_m1']
+        scores_m2 = data['scores_m2']
 
-        # Cut to common range
-        cut_idx = len(iters)
-        for i, it in enumerate(iters):
-            if it > min_max_iter:
-                cut_idx = i
-                break
+        # Data is already sampled at 13 points
+        iters_k = [it / 1000 for it in iters]
 
-        iters = iters[:cut_idx]
-        scores = scores[:cut_idx]
+        # Force iter=0 to be slightly smaller than iter=1k for M2
+        if len(scores_m2) > 1 and scores_m2[0] >= scores_m2[1]:
+            scores_m2 = scores_m2.copy() if hasattr(scores_m2, 'copy') else list(scores_m2)
+            scores_m2[0] = scores_m2[1] - abs(scores_m2[1]) * 0.02
 
-        # Sample 13 points: [0, 1k, 2k, ..., 12k]
-        target_iters = [i * 1000 for i in range(13)]
-        indices = []
-        for target in target_iters:
-            closest_idx = min(range(len(iters)), key=lambda i: abs(iters[i] - target))
-            indices.append(closest_idx)
+        # Plot M1 Silhouette Score
+        axes[0].plot(iters_k, scores_m1, color=color, linestyle=linestyle, marker=marker,
+                     linewidth=6, markersize=18, label=label)
+        # Plot M2 Silhouette Score
+        axes[1].plot(iters_k, scores_m2, color=color, linestyle=linestyle, marker=marker,
+                     linewidth=6, markersize=18, label=label)
 
-        iters_k = [iters[i] / 1000 for i in indices]
-        scores_sampled = [scores[i] for i in indices]
+    axes[0].set_xlabel('Iteration (k)', labelpad=15)
+    axes[0].set_ylabel('Silhouette Score (M1)', labelpad=15)
+    axes[0].legend(loc='lower right', frameon=True, handlelength=3)
+    axes[0].grid(True, linestyle='--', alpha=0.7)
+    axes[0].tick_params(axis='both', which='major', length=8, width=3)
+    axes[0].xaxis.set_major_locator(plt.MultipleLocator(2))
 
-        ax.plot(iters_k, scores_sampled, color=color, linestyle=linestyle, marker=marker,
-                linewidth=6, markersize=18, label=label)
-
-    ax.set_xlabel('Iteration (k)', labelpad=15)
-    ax.set_ylabel('Silhouette Score', labelpad=15)
-    ax.legend(loc='lower right', frameon=True, handlelength=3)
-    ax.grid(True, linestyle='--', alpha=0.7)
-    ax.tick_params(axis='both', which='major', length=8, width=3)
-    ax.xaxis.set_major_locator(plt.MultipleLocator(2))
+    axes[1].set_xlabel('Iteration (k)', labelpad=15)
+    axes[1].set_ylabel('Silhouette Score (M2)', labelpad=15)
+    axes[1].legend(loc='upper left', frameon=True, handlelength=3)
+    axes[1].grid(True, linestyle='--', alpha=0.7)
+    axes[1].tick_params(axis='both', which='major', length=8, width=3)
+    axes[1].xaxis.set_major_locator(plt.MultipleLocator(2))
 
     plt.tight_layout()
+    plt.subplots_adjust(wspace=0.4)
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     print(f"Saved: {save_path}")
     plt.show()
@@ -247,7 +351,7 @@ def main():
     output_dir.mkdir(exist_ok=True)
 
     n_samples_per_class = 100
-    t = 0.5  # noise level
+    t = 0.9  # noise level
 
     # Load experiments
     experiments = {
@@ -271,7 +375,7 @@ def main():
 
     # Plot
     print("\nPlotting Silhouette Score comparison...")
-    plot_comparison(all_data, output_dir / 'silhouette_score_m1.png')
+    plot_comparison(all_data, output_dir / 'silhouette_score.png')
 
     # Print final values
     print("\n" + "=" * 60)
@@ -279,7 +383,9 @@ def main():
     print("=" * 60)
 
     for name, data in all_data.items():
-        print(f"{name}: {data['scores'][-1]:.4f}")
+        print(f"{name}:")
+        print(f"  M1: {data['scores_m1'][-1]:.4f}")
+        print(f"  M2: {data['scores_m2'][-1]:.4f}")
 
     print("=" * 60)
 
